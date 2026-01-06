@@ -16,6 +16,7 @@
 
   <h2>📌 طريقة الاستخدام</h2>
   <ol>
+    <1i> شاهد الخطوات كاملة فيديو https://vt.tiktok.com/ZS5aWvfMB/ </1i>
     <li>اطلب ملف بياناتك من داخل سناب:
       <strong>الإعدادات → بياناتي (My Data)</strong>.
     </li>
@@ -64,6 +65,7 @@
 
   <h2>📌 How to Use</h2>
   <ol>
+      <1i> watch full steps - video https://vt.tiktok.com/ZS5aWvfMB/ </1i>
     <li>Request your data from Snapchat:
       <strong>Settings → My Data</strong>.
     </li>
