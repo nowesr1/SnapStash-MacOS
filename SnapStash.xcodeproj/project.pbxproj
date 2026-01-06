@@ -35,16 +35,6 @@
 			path = SnapStash;
 			sourceTree = "<group>";
 		};
-		316D7CED2F0A39630049D741 /* SnapStashTests */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = SnapStashTests;
-			sourceTree = "<group>";
-		};
-		316D7CF72F0A39630049D741 /* SnapStashUITests */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = SnapStashUITests;
-			sourceTree = "<group>";
-		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -76,8 +66,6 @@
 			isa = PBXGroup;
 			children = (
 				316D7CDE2F0A39600049D741 /* SnapStash */,
-				316D7CED2F0A39630049D741 /* SnapStashTests */,
-				316D7CF72F0A39630049D741 /* SnapStashUITests */,
 				316D7CDD2F0A39600049D741 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -130,9 +118,6 @@
 			dependencies = (
 				316D7CEC2F0A39630049D741 /* PBXTargetDependency */,
 			);
-			fileSystemSynchronizedGroups = (
-				316D7CED2F0A39630049D741 /* SnapStashTests */,
-			);
 			name = SnapStashTests;
 			packageProductDependencies = (
 			);
@@ -152,9 +137,6 @@
 			);
 			dependencies = (
 				316D7CF62F0A39630049D741 /* PBXTargetDependency */,
-			);
-			fileSystemSynchronizedGroups = (
-				316D7CF72F0A39630049D741 /* SnapStashUITests */,
 			);
 			name = SnapStashUITests;
 			packageProductDependencies = (
@@ -398,7 +380,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = UKY862SD5D;
+				DEVELOPMENT_TEAM = 72AW6U8M8C;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -425,7 +407,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = UKY862SD5D;
+				DEVELOPMENT_TEAM = 72AW6U8M8C;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
