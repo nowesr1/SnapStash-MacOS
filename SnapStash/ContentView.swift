@@ -4,11 +4,10 @@
 //
 //  Created by Nasser Alsobeie on 04/01/2026.
 //
-
 import SwiftUI
 import AVKit
 
-struct SnapchatData: Codable {
+struct SnapchatData: Codable, Sendable {
     let savedMedia: [Memory]
     
     enum CodingKeys: String, CodingKey {
@@ -16,7 +15,7 @@ struct SnapchatData: Codable {
     }
 }
 
-struct Memory: Codable, Identifiable, Equatable, Hashable {
+struct Memory: Codable, Identifiable, Equatable, Hashable, Sendable {
     let id: UUID
     let date: String
     let mediaType: String
@@ -86,64 +85,115 @@ struct Memory: Codable, Identifiable, Equatable, Hashable {
     }
 }
 
+struct YearSection: Identifiable, Equatable, Sendable {
+    let id: String
+    let months: [MonthSection]
+}
+
+struct MonthSection: Identifiable, Equatable, Sendable {
+    let id: String
+    let name: String
+    let memories: [Memory]
+}
+
 @MainActor
 class ThumbnailLoader: ObservableObject {
     @Published var image: NSImage? = nil
     @Published var isLoading = false
     
+    private var task: Task<Void, Never>?
+    
     func load(for memory: Memory) {
-        guard let url = memory.effectiveUrl, image == nil, !isLoading else { return }
+        guard let url = memory.effectiveUrl, image == nil else { return }
+        
+        task?.cancel()
         isLoading = true
         
-        Task.detached(priority: .userInitiated) {
-            var loadedImage: NSImage? = nil
-            
+        task = Task {
             if memory.isVideo {
-                let asset = AVAsset(url: url)
+                let asset = AVURLAsset(url: url)
                 let gen = AVAssetImageGenerator(asset: asset)
                 gen.appliesPreferredTrackTransform = true
+                gen.maximumSize = CGSize(width: 300, height: 300)
+                
                 do {
-                    let cgImage = try gen.copyCGImage(at: .zero, actualTime: nil)
-                    loadedImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-                } catch {
-                    print("Thumbnail fail: \(error)")
-                }
+                    let (cgImage, _) = try await gen.image(at: .zero)
+                    let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                    self.image = nsImage
+                } catch { }
             } else {
-                if let data = try? Data(contentsOf: url) {
-                    loadedImage = NSImage(data: data)
+                if let data = try? Data(contentsOf: url), let nsImage = NSImage(data: data) {
+                    self.image = nsImage
                 }
             }
-            
-            await MainActor.run {
-                self.image = loadedImage
-                self.isLoading = false
-            }
+            self.isLoading = false
         }
     }
 }
 
 @MainActor
 class MacDownloadManager: ObservableObject {
-    @Published var memories: [Memory] = []
+    @Published var sections: [YearSection] = []
+    @Published var allMemories: [Memory] = []
+    
+    @Published var isProcessing = false
     @Published var isDownloading = false
     @Published var progress: Double = 0.0
     @Published var statusMessage: String = "Import JSON to start"
     @Published var showSuccessAlert = false
     
     func loadJSON(url: URL) {
-        do {
-            let accessing = url.startAccessingSecurityScopedResource()
-            let data = try Data(contentsOf: url)
-            if accessing { url.stopAccessingSecurityScopedResource() }
-            
-            let decoder = JSONDecoder()
-            let result = try decoder.decode(SnapchatData.self, from: data)
-            
-            self.memories = result.savedMedia.sorted(by: { $0.dateObject > $1.dateObject })
-            self.statusMessage = "Loaded \(memories.count) memories."
-        } catch {
-            self.statusMessage = "Error parsing JSON: \(error.localizedDescription)"
+        isProcessing = true
+        statusMessage = "Processing large file..."
+        
+        Task {
+            do {
+                let accessing = url.startAccessingSecurityScopedResource()
+                let data = try Data(contentsOf: url)
+                if accessing { url.stopAccessingSecurityScopedResource() }
+                
+                let result = try JSONDecoder().decode(SnapchatData.self, from: data)
+                let rawMemories = result.savedMedia
+                
+                let processedSections = await MacDownloadManager.processMemories(rawMemories)
+                
+                self.sections = processedSections
+                self.allMemories = rawMemories
+                self.statusMessage = "Loaded \(rawMemories.count) memories."
+                self.isProcessing = false
+                
+            } catch {
+                self.statusMessage = "Error: \(error.localizedDescription)"
+                self.isProcessing = false
+            }
         }
+    }
+    
+    private static func processMemories(_ rawMemories: [Memory]) async -> [YearSection] {
+        let groupedByYear = Dictionary(grouping: rawMemories, by: { $0.year })
+        let sortedYears = groupedByYear.keys.sorted(by: >)
+        
+        var newSections: [YearSection] = []
+        
+        for year in sortedYears {
+            let memoriesInYear = groupedByYear[year]!
+            let groupedByMonth = Dictionary(grouping: memoriesInYear, by: { $0.month })
+            
+            let sortedMonthNames = groupedByMonth.keys.sorted { m1, m2 in
+                let d1 = groupedByMonth[m1]?.first?.date ?? ""
+                let d2 = groupedByMonth[m2]?.first?.date ?? ""
+                return d1 > d2
+            }
+            
+            var monthSections: [MonthSection] = []
+            for month in sortedMonthNames {
+                let items = groupedByMonth[month] ?? []
+                monthSections.append(MonthSection(id: "\(month)-\(year)", name: month, memories: items))
+            }
+            
+            newSections.append(YearSection(id: year, months: monthSections))
+        }
+        return newSections
     }
     
     func downloadSelected(memories: [Memory], to folderURL: URL) {
@@ -159,45 +209,59 @@ class MacDownloadManager: ObservableObject {
         
         Task {
             let total = Double(memories.count)
-            var completed = 0.0
+            var currentProgress = 0.0
             
-            await withTaskGroup(of: Void.self) { group in
-                for memory in memories {
-                    group.addTask {
-                        await self.downloadSingle(memory, to: folderURL)
+            let maxConcurrent = 5
+            var iterator = memories.makeIterator()
+            
+            await withTaskGroup(of: Bool.self) { group in
+                for _ in 0..<maxConcurrent {
+                    if let next = iterator.next() {
+                        group.addTask {
+                            await MacDownloadManager.downloadSingle(next, to: folderURL)
+                        }
                     }
                 }
                 
-                for await _ in group {
-                    completed += 1
-                    await MainActor.run {
-                        self.progress = completed / total
-                        self.statusMessage = "Saving \(Int(completed)) of \(Int(total))..."
+                for await result in group {
+                    if result { currentProgress += 1 }
+                    self.progress = currentProgress / total
+                    self.statusMessage = "Saving \(Int(currentProgress)) of \(Int(total))..."
+                    
+                    if let next = iterator.next() {
+                        group.addTask {
+                            await MacDownloadManager.downloadSingle(next, to: folderURL)
+                        }
                     }
                 }
             }
             
             folderURL.stopAccessingSecurityScopedResource()
-            
             self.isDownloading = false
             self.statusMessage = "Saved to \(folderURL.lastPathComponent)"
             self.showSuccessAlert = true
         }
     }
     
-    private func downloadSingle(_ memory: Memory, to folderURL: URL) async {
+    private static func downloadSingle(_ memory: Memory, to folderURL: URL) async -> Bool {
         let destination = folderURL.appendingPathComponent(memory.filename)
-        if FileManager.default.fileExists(atPath: destination.path) { return }
+        if FileManager.default.fileExists(atPath: destination.path) { return true }
         
-        guard let url = memory.effectiveUrl else { return }
+        guard let url = memory.effectiveUrl else { return false }
         
         do {
             let (data, _) = try await URLSession.shared.data(from: url)
             try data.write(to: destination)
-            let attributes = [FileAttributeKey.creationDate: memory.dateObject]
-            try FileManager.default.setAttributes(attributes, ofItemAtPath: destination.path)
+            
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd HH:mm:ss 'UTC'"
+            formatter.timeZone = TimeZone(secondsFromGMT: 0)
+            if let dateObj = formatter.date(from: memory.date) {
+                try FileManager.default.setAttributes([.creationDate: dateObj], ofItemAtPath: destination.path)
+            }
+            return true
         } catch {
-            print("Download error: \(memory.filename)")
+            return false
         }
     }
 }
@@ -211,28 +275,6 @@ struct ContentView: View {
     
     let columns = [GridItem(.adaptive(minimum: 140, maximum: 160), spacing: 10)]
     
-    var groupedMemories: [(year: String, months: [(month: String, memories: [Memory])])] {
-        let groupedByYear = Dictionary(grouping: manager.memories, by: { $0.year })
-        let sortedYears = groupedByYear.keys.sorted(by: >)
-        
-        return sortedYears.map { year in
-            let memoriesInYear = groupedByYear[year]!
-            let groupedByMonth = Dictionary(grouping: memoriesInYear, by: { $0.month })
-            
-            let sortedMonths = groupedByMonth.keys.sorted { m1, m2 in
-                let d1 = memoriesInYear.first(where: { $0.month == m1 })?.dateObject ?? Date.distantPast
-                let d2 = memoriesInYear.first(where: { $0.month == m2 })?.dateObject ?? Date.distantPast
-                return d1 > d2
-            }
-            
-            let monthGroups = sortedMonths.map { month in
-                (month: month, memories: groupedByMonth[month]!)
-            }
-            
-            return (year: year, months: monthGroups)
-        }
-    }
-    
     var body: some View {
         ZStack {
             VStack(spacing: 0) {
@@ -242,11 +284,9 @@ struct ContentView: View {
                             Label("Import JSON", systemImage: "square.and.arrow.down")
                         }
                         
-                        if !manager.memories.isEmpty {
+                        if !manager.sections.isEmpty {
                             Divider().frame(height: 20)
-                            Button("Select") {
-                                isSelectionMode = true
-                            }
+                            Button("Select") { isSelectionMode = true }
                         }
                     } else {
                         Button("Cancel") {
@@ -257,18 +297,12 @@ struct ContentView: View {
                         
                         Divider().frame(height: 20)
                         
-                        Button("Select All") {
-                            selection = Set(manager.memories)
-                        }
-                        
-                        Button("Deselect All") {
-                            selection.removeAll()
-                        }
+                        Button("Select All") { selection = Set(manager.allMemories) }
+                        Button("Deselect All") { selection.removeAll() }
                         
                         Spacer()
                         
-                        Text("\(selection.count) selected")
-                            .foregroundColor(.secondary)
+                        Text("\(selection.count) selected").foregroundColor(.secondary)
                         
                         Button(action: saveSelected) {
                             Label("Download Selected", systemImage: "arrow.down.circle.fill")
@@ -276,7 +310,6 @@ struct ContentView: View {
                         .buttonStyle(.borderedProminent)
                         .disabled(selection.isEmpty)
                     }
-                    
                     Spacer()
                 }
                 .padding()
@@ -284,47 +317,30 @@ struct ContentView: View {
                 
                 Divider()
                 
-                if manager.memories.isEmpty {
-                    emptyState
+                if manager.isProcessing {
+                    VStack {
+                        Spacer()
+                        ProgressView()
+                        Text("Processing Data...").padding(.top)
+                        Spacer()
+                    }
+                } else if manager.sections.isEmpty {
+                    VStack(spacing: 15) {
+                        Spacer()
+                        Image(systemName: "photo.stack").font(.system(size: 50)).foregroundColor(.gray)
+                        Text("Import 'memories_history.json' to start").foregroundColor(.secondary)
+                        Spacer()
+                    }
                 } else {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 20) {
-                            ForEach(groupedMemories, id: \.year) { yearGroup in
-                                VStack(alignment: .leading, spacing: 10) {
-                                    Text(yearGroup.year)
-                                        .font(.title2)
-                                        .bold()
-                                        .padding(.leading)
-                                        .padding(.top)
-                                    
-                                    ForEach(yearGroup.months, id: \.month) { monthGroup in
-                                        VStack(alignment: .leading, spacing: 5) {
-                                            Text(monthGroup.month)
-                                                .font(.headline)
-                                                .foregroundColor(.secondary)
-                                                .padding(.leading)
-                                            
-                                            LazyVGrid(columns: columns, spacing: 10) {
-                                                ForEach(monthGroup.memories) { memory in
-                                                    MemoryGridItem(
-                                                        memory: memory,
-                                                        isSelected: selection.contains(memory),
-                                                        showCheckbox: isSelectionMode
-                                                    )
-                                                    .contentShape(Rectangle())
-                                                    .onTapGesture {
-                                                        if isSelectionMode {
-                                                            toggleSelection(for: memory)
-                                                        } else {
-                                                            previewMemory = memory
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            .padding(.horizontal)
-                                        }
-                                    }
-                                }
+                            ForEach(manager.sections) { yearSection in
+                                YearGroupView(
+                                    yearSection: yearSection,
+                                    isSelectionMode: isSelectionMode,
+                                    selection: $selection,
+                                    onPreview: { memory in previewMemory = memory }
+                                )
                             }
                         }
                         .padding(.bottom)
@@ -343,14 +359,10 @@ struct ContentView: View {
             if manager.isDownloading {
                 Color.black.opacity(0.5)
                 VStack(spacing: 20) {
-                    ProgressView()
-                        .scaleEffect(1.5)
-                    Text("Saving Memories...")
-                        .font(.title2)
-                        .bold()
+                    ProgressView().scaleEffect(1.5)
+                    Text("Saving Memories...").font(.title2).bold()
                     Text(manager.statusMessage)
-                    ProgressView(value: manager.progress)
-                        .frame(width: 200)
+                    ProgressView(value: manager.progress).frame(width: 200)
                 }
                 .padding(40)
                 .background(RoundedRectangle(cornerRadius: 12).fill(Color(NSColor.windowBackgroundColor)))
@@ -365,16 +377,11 @@ struct ContentView: View {
             }
         }
         .sheet(item: $previewMemory) { memory in
-            PreviewView(memory: memory)
-                .frame(width: 800, height: 600)
+            PreviewView(memory: memory).frame(width: 800, height: 600)
         }
         .alert(isPresented: $manager.showSuccessAlert) {
             Alert(title: Text("Success"), message: Text("All files saved successfully."), dismissButton: .default(Text("OK")))
         }
-    }
-    
-    func toggleSelection(for memory: Memory) {
-        if selection.contains(memory) { selection.remove(memory) } else { selection.insert(memory) }
     }
     
     func saveSelected() {
@@ -390,13 +397,71 @@ struct ContentView: View {
             }
         }
     }
+}
+
+struct YearGroupView: View {
+    let yearSection: YearSection
+    let isSelectionMode: Bool
+    @Binding var selection: Set<Memory>
+    let onPreview: (Memory) -> Void
     
-    var emptyState: some View {
-        VStack(spacing: 15) {
-            Spacer()
-            Image(systemName: "photo.stack").font(.system(size: 50)).foregroundColor(.gray)
-            Text("Import 'memories_history.json' to start").foregroundColor(.secondary)
-            Spacer()
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(yearSection.id)
+                .font(.title2)
+                .bold()
+                .padding(.leading)
+                .padding(.top)
+            
+            ForEach(yearSection.months) { monthSection in
+                MonthGroupView(
+                    monthSection: monthSection,
+                    isSelectionMode: isSelectionMode,
+                    selection: $selection,
+                    onPreview: onPreview
+                )
+            }
+        }
+    }
+}
+
+struct MonthGroupView: View {
+    let monthSection: MonthSection
+    let isSelectionMode: Bool
+    @Binding var selection: Set<Memory>
+    let onPreview: (Memory) -> Void
+    
+    let columns = [GridItem(.adaptive(minimum: 140, maximum: 160), spacing: 10)]
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(monthSection.name)
+                .font(.headline)
+                .foregroundColor(.secondary)
+                .padding(.leading)
+            
+            LazyVGrid(columns: columns, spacing: 10) {
+                ForEach(monthSection.memories) { memory in
+                    MemoryGridItem(
+                        memory: memory,
+                        isSelected: selection.contains(memory),
+                        showCheckbox: isSelectionMode
+                    )
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        if isSelectionMode {
+                            if selection.contains(memory) {
+                                selection.remove(memory)
+                            } else {
+                                selection.insert(memory)
+                            }
+                        } else {
+                            onPreview(memory)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal)
         }
     }
 }
@@ -502,7 +567,6 @@ struct PreviewView: View {
 
 struct MacPlayerView: NSViewRepresentable {
     let url: URL
-    
     func makeNSView(context: Context) -> AVPlayerView {
         let playerView = AVPlayerView()
         playerView.controlsStyle = .floating
@@ -510,9 +574,7 @@ struct MacPlayerView: NSViewRepresentable {
         playerView.player?.play()
         return playerView
     }
-    
     func updateNSView(_ nsView: AVPlayerView, context: Context) {}
-    
     static func dismantleNSView(_ nsView: AVPlayerView, coordinator: ()) {
         nsView.player?.pause()
         nsView.player = nil
